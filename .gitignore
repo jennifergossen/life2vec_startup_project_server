@@ -157,3 +157,11 @@ wandb/
 *.temp
 .DS_Store
 Thumbs.db
+
+# Large data files - keep local only
+data/cleaned/cleaned_startup/*.csv
+data/cleaned/cleaned_startup/*.pkl
+data/processed_startup/*.csv
+data/processed_startup/*.pkl
+data/interim/
+data/processed/
