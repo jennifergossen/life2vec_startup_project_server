@@ -6,6 +6,7 @@ COMPLETE FIXED training script for your beast hardware:
 - 4 GPUs (2x A100 80GB + 2x L40S 44GB)
 - 128 CPU cores
 - Optimized batch sizes, workers, and distributed training
+- FIXED: Early stopping callback for quick test mode
 """
 
 import torch
@@ -75,7 +76,7 @@ def get_optimal_config(num_gpus=4, total_memory_gb=247, quick_test=False):
             "total_batch_size": 128 * num_gpus,
             "num_workers": 16,   # Use many of your 128 cores
             # Learning rates for large batch training
-            "learning_rate": 2e-4 * (num_gpus * 0.5),  # Scale with sqrt(gpus) - FIXED SYNTAX
+            "learning_rate": 2e-4 * (num_gpus * 0.5),  # Scale with sqrt(gpus)
             "max_epochs": 20,    # Default epochs for full training
             # Mixed precision for speed
             "precision": "16-mixed",
@@ -287,7 +288,7 @@ def main():
         
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        model_memory_gb = total_params * 4 / 1024**3  # 4 bytes per float32 parameter - FIXED SYNTAX
+        model_memory_gb = total_params * 4 / (1024**3)  # 4 bytes per float32 parameter
         print(f"✅ Model created successfully")
         print(f"🔢 Total parameters: {total_params:,}")
         print(f"🎯 Trainable parameters: {trainable_params:,}")
@@ -317,23 +318,28 @@ def main():
         logger = TensorBoardLogger("lightning_logs", name=experiment_name)
         print("📊 Using TensorBoard logging")
     
-    # Callbacks
+    # Callbacks - FIXED for quick test mode
     callbacks = [
         ModelCheckpoint(
-            dirpath="checkpoints_beast",
-            filename=f"{experiment_name}-{{epoch:02d}}-{{val_loss:.4f}}",
-            save_top_k=3,
-            monitor="val_loss",
+            dirpath="checkpoints",  # Changed from checkpoints_beast 😄
+            filename=f"{experiment_name}-{{epoch:02d}}-{{step:06d}}",
+            save_top_k=-1,  # Save all checkpoints when monitor=None
+            monitor=None,  # Don't monitor any metric, just save every epoch
             save_last=True,
             every_n_epochs=1
         ),
-        EarlyStopping(
-            monitor="val_loss",
-            patience=5 if not args.quick_test else 2,
-            mode="min"
-        ),
         LearningRateMonitor(logging_interval='step')
     ]
+    
+    # Only add early stopping for full training (not quick test)
+    if not args.quick_test:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val_loss",
+                patience=5,
+                mode="min"
+            )
+        )
     
     # Distributed strategy for multi-GPU
     if num_gpus > 1:
@@ -369,7 +375,7 @@ def main():
         limit_train_batches=50 if args.quick_test else None,
     )
     
-    print(f"\n��️ Starting training...")
+    print(f"\n🏋️ Starting training...")
     print(f"💪 Configuration: {num_gpus} GPUs × {config['batch_size_per_gpu']} batch size = {num_gpus * config['batch_size_per_gpu']} total")
     print(f"⚡ Precision: {config['precision']}")
     print(f"🔥 Estimated time: {estimated_hours:.1f} hours")
@@ -385,14 +391,14 @@ def main():
         trainer.fit(model=model, datamodule=datamodule)
         print("\n🎉 TRAINING COMPLETED SUCCESSFULLY!")
         
-        # Save final model
+        # Save final model (fix pickling issue)
         save_path = f"startup2vec_{experiment_name}_final.pt"
         torch.save({
             'model_state_dict': model.state_dict(),
-            'vocab': datamodule.vocabulary,
             'hparams': hparams,
             'config': config,
-            'training_args': vars(args)
+            'training_args': vars(args),
+            'vocab_size': vocab_size  # Save vocab size instead of vocab object
         }, save_path)
         print(f"💾 Model saved to: {save_path}")
         
@@ -423,6 +429,6 @@ def main():
         traceback.print_exc()
         return 1
 
-if __name__ == "__main__":  # FIXED: was missing underscores
+if __name__ == "__main__":
     exit_code = main()
     sys.exit(exit_code)

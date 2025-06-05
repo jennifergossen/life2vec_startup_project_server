@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Step 4: Custom DataModule for Large Startup Dataset (FIXED VERSION)
+Step 4: Custom DataModule for Large Startup Dataset (FIXED VERSION - 4D INPUT)
 
 This creates a life2vec-compatible datamodule that:
 - Uses existing corpus files (from step 3.1) 
 - Uses existing vocabulary (from step 3.2)
 - Handles large datasets without PyArrow overflow
-- Produces correct output for step 5 training
-- FIXES: sequence_id tensor creation and error handling
+- Produces CORRECT 4D INPUT for step 5 training
+- FIXES: Creates proper [4, sequence_length] input format
 """
 
 import argparse
@@ -69,7 +69,7 @@ class StartupVocabulary:
         return len(self._token2index)
 
 class StartupDataset(Dataset):
-    """Custom dataset that processes corpus data for life2vec training"""
+    """Custom dataset that processes corpus data for life2vec training with 4D input"""
     
     def __init__(self, corpus_file: Path, vocabulary: StartupVocabulary, 
                  max_length=512, mask_ratio=0.15, smart_masking=False):
@@ -102,7 +102,7 @@ class StartupDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx):
-        """Convert a single sentence to life2vec format"""
+        """Convert a single sentence to life2vec 4D format"""
         try:
             row = self.data.iloc[idx]
             
@@ -124,22 +124,54 @@ class StartupDataset(Dataset):
             if len(sequence) > self.max_length:
                 sequence = [self.cls_id] + token_ids[:self.max_length-2] + [self.sep_id]
             
-            # Create padding mask (True for real tokens, False for padding)
+            # Get actual sequence length
             seq_len = len(sequence)
-            padding_mask = [True] * seq_len + [False] * (self.max_length - seq_len)
             
-            # Pad sequence
+            # Pad sequence to max_length
             sequence = sequence + [self.pad_id] * (self.max_length - seq_len)
             
-            # Apply MLM masking
-            masked_sequence, target_tokens, target_positions = self.apply_mlm_masking(
-                sequence, padding_mask
+            # Create padding mask (True for real tokens, False for padding)
+            padding_mask = [True] * seq_len + [False] * (self.max_length - seq_len)
+            
+            # ========== LIFE2VEC 4D INPUT FORMAT ==========
+            # Create 4D input: [4, max_length] where dimensions are:
+            # 0: token IDs
+            # 1: absolute position (days since reference)
+            # 2: age values 
+            # 3: segment IDs
+            
+            input_4d = np.zeros((4, self.max_length), dtype=np.int64)
+            
+            # Dimension 0: Token IDs
+            input_4d[0, :] = sequence
+            
+            # Dimension 1: Absolute position (sequential for now)
+            # In real life2vec, this would be days since reference date
+            abs_positions = list(range(seq_len)) + [0] * (self.max_length - seq_len)
+            input_4d[1, :] = abs_positions
+            
+            # Dimension 2: Age values (dummy - in real life2vec, this is person's age)
+            # For startup data, we can use company age or dummy values
+            age_values = [30] * seq_len + [0] * (self.max_length - seq_len)  # dummy age 30
+            input_4d[2, :] = age_values
+            
+            # Dimension 3: Segment IDs (alternating pattern)
+            # Life2vec uses this to distinguish different types of events
+            segment_values = [(i % 4) for i in range(seq_len)] + [0] * (self.max_length - seq_len)
+            input_4d[3, :] = segment_values
+            
+            # Apply MLM masking to the token dimension only
+            masked_tokens, target_tokens, target_positions = self.apply_mlm_masking(
+                input_4d[0].copy(), padding_mask
             )
             
-            # Create life2vec-style output - USE IDX AS SEQUENCE_ID
+            # Update the token dimension with masked tokens
+            input_4d[0, :] = masked_tokens
+            
+            # Create life2vec-style output
             return {
                 'sequence_id': torch.tensor(idx, dtype=torch.long),
-                'input_ids': torch.tensor(masked_sequence, dtype=torch.long),
+                'input_ids': torch.tensor(input_4d, dtype=torch.long),  # Shape: [4, max_length]
                 'padding_mask': torch.tensor(padding_mask, dtype=torch.bool),
                 'target_tokens': torch.tensor(target_tokens, dtype=torch.long),
                 'target_pos': torch.tensor(target_positions, dtype=torch.long),
@@ -149,11 +181,17 @@ class StartupDataset(Dataset):
             
         except Exception as e:
             logging.error(f"Error processing index {idx}: {e}")
-            # Return a minimal valid sample
+            # Return a minimal valid sample with 4D format
             max_targets = max(1, int(self.max_length * self.mask_ratio))
+            
+            # Create 4D input for error case
+            input_4d = np.zeros((4, self.max_length), dtype=np.int64)
+            input_4d[0, 0] = self.cls_id
+            input_4d[0, 1] = self.sep_id
+            
             return {
                 'sequence_id': torch.tensor(idx, dtype=torch.long),
-                'input_ids': torch.tensor([self.cls_id, self.sep_id] + [self.pad_id] * (self.max_length-2), dtype=torch.long),
+                'input_ids': torch.tensor(input_4d, dtype=torch.long),
                 'padding_mask': torch.tensor([True, True] + [False] * (self.max_length-2), dtype=torch.bool),
                 'target_tokens': torch.tensor([0] * max_targets, dtype=torch.long),
                 'target_pos': torch.tensor([self.max_length-1] * max_targets, dtype=torch.long),
@@ -215,7 +253,7 @@ class StartupDataset(Dataset):
         return sequence, target_tokens, target_positions
 
 class StartupDataModule(pl.LightningDataModule):
-    """Custom life2vec-compatible datamodule"""
+    """Custom life2vec-compatible datamodule with 4D input"""
     
     def __init__(self, corpus_name="startup_corpus", vocab_name="startup_vocab",
                  max_length=512, mask_ratio=0.15, smart_masking=False,
@@ -309,10 +347,10 @@ class StartupDataModule(pl.LightningDataModule):
         )
 
 def test_datamodule(datamodule, test_batches=3):
-    """Test the custom datamodule"""
+    """Test the custom datamodule with 4D format"""
     log = logging.getLogger(__name__)
     
-    log.info("🧪 Testing custom datamodule...")
+    log.info("�� Testing custom datamodule with 4D input format...")
     
     try:
         # Setup datamodule
@@ -325,17 +363,49 @@ def test_datamodule(datamodule, test_batches=3):
         for i, batch in enumerate(train_loader):
             log.info(f"   📦 Batch {i+1}:")
             log.info(f"      🔑 Keys: {list(batch.keys())}")
-            log.info(f"      📏 Input shape: {batch['input_ids'].shape}")
+            log.info(f"      📏 Input shape: {batch['input_ids'].shape} (should be [batch, 4, sequence])")
+            
+            # Validate 4D format
+            input_shape = batch['input_ids'].shape
+            if len(input_shape) != 3:
+                log.error(f"❌ Wrong input dimensions! Expected 3D [batch, 4, sequence], got {len(input_shape)}D")
+                return False
+            
+            if input_shape[1] != 4:
+                log.error(f"❌ Wrong feature dimensions! Expected 4 features, got {input_shape[1]}")
+                return False
+            
+            log.info(f"      ✅ Correct 4D format: [batch={input_shape[0]}, features=4, sequence={input_shape[2]}]")
             log.info(f"      🎭 Target tokens shape: {batch['target_tokens'].shape}")
             log.info(f"      📍 Target positions shape: {batch['target_pos'].shape}")
             log.info(f"      ✅ Padding mask shape: {batch['padding_mask'].shape}")
             log.info(f"      🆔 Sequence IDs shape: {batch['sequence_id'].shape}")
             
-            # Show some actual values
-            log.info(f"      📊 Sample input_ids: {batch['input_ids'][0][:20].tolist()}")
-            log.info(f"      🎯 Sample targets: {batch['target_tokens'][0][:5].tolist()}")
-            log.info(f"      📍 Sample positions: {batch['target_pos'][0][:5].tolist()}")
-            log.info(f"      🆔 Sample sequence_ids: {batch['sequence_id'][:5].tolist()}")
+            # Show actual values for each dimension
+            input_4d = batch['input_ids'][0]  # First sample
+            log.info(f"      📊 Sample values for first sequence:")
+            log.info(f"         Tokens (dim 0): {input_4d[0][:10].tolist()}")
+            log.info(f"         Abspos (dim 1): {input_4d[1][:10].tolist()}")
+            log.info(f"         Age (dim 2): {input_4d[2][:10].tolist()}")
+            log.info(f"         Segment (dim 3): {input_4d[3][:10].tolist()}")
+            
+            # Validate ranges
+            tokens = input_4d[0]
+            segments = input_4d[3]
+            vocab_size = datamodule.vocabulary.size()
+            
+            log.info(f"      🔍 Value ranges:")
+            log.info(f"         Tokens: {tokens.min().item()} - {tokens.max().item()} (vocab: {vocab_size})")
+            log.info(f"         Segments: {segments.min().item()} - {segments.max().item()} (should be 0-3)")
+            
+            # Check bounds
+            if tokens.max().item() >= vocab_size:
+                log.error(f"❌ Token ID out of bounds: {tokens.max().item()} >= {vocab_size}")
+                return False
+            
+            if segments.max().item() >= 4:
+                log.error(f"❌ Segment ID out of bounds: {segments.max().item()} >= 4")
+                return False
             
             # Validate data types
             assert batch['input_ids'].dtype == torch.long, "input_ids should be long"
@@ -368,6 +438,7 @@ def test_datamodule(datamodule, test_batches=3):
         log.info(f"   Test: {len(datamodule.test_dataset):,}")
         log.info(f"   Vocabulary: {datamodule.vocabulary.size():,}")
         
+        log.info("✅ 4D FORMAT VALIDATION PASSED!")
         return True
         
     except Exception as e:
@@ -378,7 +449,7 @@ def test_datamodule(datamodule, test_batches=3):
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description="Step 4: Custom DataModule for Large Startup Dataset")
+    parser = argparse.ArgumentParser(description="Step 4: Custom DataModule with 4D Input Format")
     
     # Component names
     parser.add_argument("--corpus-name", type=str, default="startup_corpus",
@@ -416,7 +487,7 @@ def main():
     start_time = time.time()
     
     try:
-        log.info("🚀 CREATING CUSTOM LIFE2VEC DATAMODULE (FIXED VERSION)")
+        log.info("🚀 CREATING LIFE2VEC 4D DATAMODULE")
         log.info("=" * 60)
         log.info("📋 Configuration:")
         log.info(f"   📚 Corpus: {args.corpus_name}")
@@ -426,9 +497,10 @@ def main():
         log.info(f"   🧠 Smart masking: {args.smart_masking}")
         log.info(f"   📦 Batch size: {args.batch_size}")
         log.info(f"   👷 Workers: {args.num_workers}")
+        log.info(f"   🎯 Input format: [batch, 4, sequence] - 4D LIFE2VEC FORMAT")
         
         # Create datamodule
-        log.info("🔧 Creating custom datamodule...")
+        log.info("🔧 Creating 4D datamodule...")
         datamodule = StartupDataModule(
             corpus_name=args.corpus_name,
             vocab_name=args.vocab_name,
@@ -439,57 +511,31 @@ def main():
             num_workers=args.num_workers
         )
         
-        log.info("✅ Custom datamodule created")
+        log.info("✅ 4D datamodule created")
         
         # Test the datamodule
-        log.info("🧪 Testing datamodule...")
+        log.info("🧪 Testing 4D datamodule...")
         test_success = test_datamodule(datamodule, args.test_batches)
         
         if not test_success:
-            log.error("❌ Datamodule testing failed")
+            log.error("❌ 4D datamodule testing failed")
             return 1
-        
-        # Save datamodule for training
-        output_dir = Path(f"data/processed/datamodules")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        datamodule_path = output_dir / f"{args.corpus_name}_datamodule.pkl"
-        
-        # Save key info (not the whole object due to pickling issues)
-        datamodule_config = {
-            'corpus_name': args.corpus_name,
-            'vocab_name': args.vocab_name,
-            'max_length': args.max_length,
-            'mask_ratio': args.mask_ratio,
-            'smart_masking': args.smart_masking,
-            'batch_size': args.batch_size,
-            'num_workers': args.num_workers,
-            'vocab_size': datamodule.vocabulary.size(),
-            'train_size': len(datamodule.train_dataset),
-            'val_size': len(datamodule.val_dataset),
-            'test_size': len(datamodule.test_dataset)
-        }
-        
-        import pickle
-        with open(datamodule_path, 'wb') as f:
-            pickle.dump(datamodule_config, f)
         
         total_time = time.time() - start_time
         
-        log.info("🎉 SUCCESS!")
-        log.info(f"✅ Custom datamodule ready")
-        log.info(f"📊 Vocabulary size: {datamodule.vocabulary.size():,}")
+        log.info("�� SUCCESS!")
+        log.info(f"✅ 4D Life2vec datamodule ready")
+        log.info(f"📊 Input format: [batch, 4, {args.max_length}]")
+        log.info(f"📖 Vocabulary size: {datamodule.vocabulary.size():,}")
         log.info(f"📦 Batch size: {args.batch_size}")
-        log.info(f"📏 Max length: {args.max_length}")
         log.info(f"🔢 Dataset sizes:")
         log.info(f"   📚 Train: {len(datamodule.train_dataset):,}")
         log.info(f"   📝 Val: {len(datamodule.val_dataset):,}")
         log.info(f"   🧪 Test: {len(datamodule.test_dataset):,}")
-        log.info(f"💾 Config saved to: {datamodule_path}")
         log.info(f"⏱️  Total time: {total_time:.1f} seconds")
         log.info("")
-        log.info("🚀 Ready for model training!")
-        log.info("💡 Use this datamodule in your training script")
+        log.info("�� Ready for life2vec training!")
+        log.info("💡 The 4D input format matches life2vec requirements")
         
         return 0
         
