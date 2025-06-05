@@ -1,4 +1,8 @@
-# src/dataloaders/tasks/base.py
+# src/dataloaders/tasks/startup_base.py
+"""
+Startup-specific task base that uses uuid instead of USER_ID
+"""
+
 import random
 from dataclasses import asdict, dataclass
 from itertools import accumulate
@@ -8,7 +12,6 @@ import numpy as np
 import pandas as pd
 import torch
 from functools import partial
-
 
 from src.dataloaders.augment import (
     add_noise2time,
@@ -24,74 +27,38 @@ if TYPE_CHECKING:
     from src.dataloaders.datamodule import L2VDataModule
     from src.dataloaders.types import EncodedDocument
 
-
 def collate_encoded_documents(
     batch: List["EncodedDocument"],
 ) -> Dict[str, torch.Tensor]:
     dicts = [asdict(x) for x in batch]
-    return torch.utils.data.default_collate(dicts)  # type: ignore
+    return torch.utils.data.default_collate(dicts)
 
+_TaskT = TypeVar("_TaskT", bound="StartupTask")
 
-_TaskT = TypeVar("_TaskT", bound="Task")
-
-
-def preprocessor(task: _TaskT, x: StartupDocument, is_train: bool) -> "EncodedDocument[_TaskT]":
+def startup_preprocessor(task: _TaskT, x: StartupDocument, is_train: bool) -> "EncodedDocument[_TaskT]":
     x = task.augment_document(x, is_train=is_train)
     x = task.clip_document(x)
     return task.encode_document(x)
 
-
 @dataclass
-class Task:
+class StartupTask:
     """
-    Base class for processing :class:`src.data.types.StartupDocument` objects
-    for various ML tasks. Includes default implementations for clipping and augmenting
-    documents.
-    In order to implement a new task, we have to implement the :meth:`encode_sequence`,
-    which defines how the documents should be encoded for a specific task, ie. what
-    input the forward method of the model expects for the task in question.
-
-    Also defines a default implementation for pulling :class:`StartupDocument` objects
-    out of the sentence data provided by the :class:`src.data.Corpus`. Task
-    implementations can extend this method and save task-specific information in the
-    :attr:`task_info` field
-
-    :param name: The name of the task.
-    :param max_length: The maximum length of the encoded documents
-    :param no_sep: If True, don't include the [SEP] token between sentences.
-
-    :param p_timecut:
-    :param p_resample:
-    :param p_abspos_noise:
-    :param p_hide_background:
-    :param p_shuffle_sentences:
-
-    :param shuffle_within_sentences:
-
-
-    .. todo::
-        Confirm this is what no_sep is actually for since this has always been False as
-        far as I (Søren) know
-
+    Base class for processing StartupDocument objects for ML tasks
+    Uses uuid instead of USER_ID throughout
     """
 
     # General
     name: str
     max_length: int
-    # It True, then don't include the [SEP] token between sentences.
     no_sep: bool = False
 
-    # Augmentation
+    # Augmentation (same as original but for startups)
     p_sequence_timecut: float = 0.0
     p_sequence_resample: float = 0.0
     p_sequence_abspos_noise: float = 0.0
     p_sequence_hide_background: float = 0.0
     p_sentence_drop_tokens: float = 0.0
-
     shuffle_within_sentences: bool = True
-
-    # Task specific
-    ...
 
     def register(self, datamodule: "L2VDataModule") -> None:
         self.datamodule = datamodule
@@ -99,55 +66,51 @@ class Task:
     def get_preprocessor(
         self: _TaskT, is_train: bool
     ) -> Callable[[StartupDocument], "EncodedDocument[_TaskT]"]:
-
-        return partial(preprocessor, self, is_train=is_train)
+        return partial(startup_preprocessor, self, is_train=is_train)
 
     def augment_document(
         self, document: StartupDocument, is_train: bool
     ) -> StartupDocument:
+        """Augment startup documents (similar to person documents)"""
 
         if self.shuffle_within_sentences:
-            # TODO: Maybe we should only do this for training?
             document.sentences = [
                 random.sample(x, k=len(x)) for x in document.sentences
             ]
 
-        # Cut document before 1st January 2016
+        # Cut document before threshold
         document = align_document(document)
 
         if is_train:
-
             # AUGMENTATION WITH NOISE
             p = np.random.uniform(low=0.0, high=1.0, size=[5])
 
-            # Should be in the exact order
-            # 1. TIMECUT (returns cut document)
+            # 1. TIMECUT
             if p[0] < self.p_sequence_timecut:
-                document = make_timecut(document)  # random timecut
+                document = make_timecut(document)
             # 2. RESAMPLE DOCUMENT
             if p[1] < self.p_sequence_resample:
                 document = resample_document(document)
-            # 2. ADD NOISE TO ABSPOS
+            # 3. ADD NOISE TO ABSPOS
             if p[2] < self.p_sequence_abspos_noise:
                 document = add_noise2time(document)
-            # 3. HIDE BACKGROUND
+            # 4. HIDE BACKGROUND
             if p[3] < self.p_sequence_hide_background:
                 document.background = None
-            # 4. DROP TOKENS FROM THE SEQUENCE
+            # 5. DROP TOKENS
             if p[4] < self.p_sentence_drop_tokens:
                 document = drop_tokens(document, p=self.p_sentence_drop_tokens)
 
-        # 5. ADD SEGMENT
+        # ADD SEGMENT
         from itertools import cycle, islice
-
-        segment_pattern = [2, 3, 1]  # Background is segment always 1
+        segment_pattern = [2, 3, 1]  # Background is segment 1
         document.segment = list(
             islice(cycle(segment_pattern), len(document.sentences)))
 
         return document
 
     def clip_document(self, document: StartupDocument) -> StartupDocument:
-
+        """Clip startup documents to max length"""
         assert document.segment is not None
 
         sep_size = 0 if self.no_sep else 1
@@ -175,30 +138,47 @@ class Task:
     ) -> "EncodedDocument[_TaskT]":
         raise NotImplementedError
 
-    def get_document(self, person_sentences: pd.DataFrame) -> StartupDocument:
+    def get_document(self, startup_sentences: pd.DataFrame) -> StartupDocument:
+        """Create StartupDocument from sentences - uses uuid instead of USER_ID"""
+        
+        # Get startup_id (uuid) from index
+        startup_id = startup_sentences.name  # This is the index value
+        sentences = [x.split(" ") for x in startup_sentences.SENTENCE]
+        abspos = (startup_sentences.RECORD_DATE + 1).tolist()
+        age = startup_sentences.AGE.tolist()
 
-        person_id = person_sentences.name
-        sentences = [x.split(" ") for x in person_sentences.SENTENCE]
-        abspos = (person_sentences.RECORD_DATE + 1).tolist()
-        age = person_sentences.AGE.tolist()
-
-        after_threshold = person_sentences.AFTER_THRESHOLD
+        after_threshold = startup_sentences.AFTER_THRESHOLD
         try:
             timecut_pos = next(i for i, k in enumerate(after_threshold) if k)
         except StopIteration:
             timecut_pos = len(after_threshold)
 
-        birthday = person_sentences.BIRTHDAY.iloc[0]
-        sex = person_sentences.SEX.iloc[0]
+        # Get startup background info
+        country = startup_sentences.get('country_code', 'US').iloc[0] if 'country_code' in startup_sentences.columns else 'US'
+        status = startup_sentences.get('status', 'operating').iloc[0] if 'status' in startup_sentences.columns else 'operating'
+        
+        # Get founding date
+        if 'founded_on' in startup_sentences.columns:
+            founded_on = startup_sentences.founded_on.iloc[0]
+            if pd.notna(founded_on):
+                founding_year = founded_on.year
+                founding_month = founded_on.month
+            else:
+                founding_year = 2000
+                founding_month = 1
+        else:
+            founding_year = 2000
+            founding_month = 1
 
         background = StartupBackground(
-            gender=sex,
-            birth_month=birthday.month,
-            birth_year=birthday.year,
+            country=country,
+            founding_year=founding_year,
+            founding_month=founding_month,
+            status=status
         )
 
         return StartupDocument(
-            person_id=person_id,
+            startup_id=str(startup_id),  # Convert uuid to string
             sentences=sentences,
             abspos=abspos,
             age=age,
