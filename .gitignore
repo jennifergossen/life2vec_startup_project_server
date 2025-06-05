@@ -169,3 +169,6 @@ data/processed/
 *.pth
 *.h5
 data/
+data/
+*.csv
+# Large data files - store separately
