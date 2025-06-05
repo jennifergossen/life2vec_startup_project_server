@@ -332,14 +332,14 @@ def main():
     ]
     
     # Only add early stopping for full training (not quick test)
-    if not args.quick_test:
-        callbacks.append(
-            EarlyStopping(
-                monitor="val_loss",
-                patience=5,
-                mode="min"
-            )
-        )
+    # if not args.quick_test:
+    #     callbacks.append(
+    #         EarlyStopping(
+    #             monitor="val_loss",
+    #             patience=5,
+    #             mode="min"
+    #         )
+    #     )
     
     # Distributed strategy for multi-GPU
     if num_gpus > 1:
