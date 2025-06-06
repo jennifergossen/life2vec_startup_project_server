@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 """
-COMPLETE FIXED training script for your beast hardware:
-- Fixed import issues
+ROBUST FIXED training script for your beast hardware:
+- Fixed learning rate scheduler step limit issue
+- Fixed early stopping callback
+- Added comprehensive error handling
 - 4 GPUs (2x A100 80GB + 2x L40S 44GB)
 - 128 CPU cores
-- Optimized batch sizes, workers, and distributed training
-- FIXED: Early stopping callback for quick test mode
+- Optimized for overnight training reliability
 """
 
 import torch
@@ -162,6 +163,7 @@ def main():
     parser.add_argument("--use-wandb", action="store_true", help="Use WandB logging")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=None, help="Override number of workers")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Resume from checkpoint path")
     args = parser.parse_args()
     
     print("🚀 STARTUP LIFE2VEC - BEAST MODE TRAINING!")
@@ -244,7 +246,7 @@ def main():
     print(f"   ⏰ Estimated time: {estimated_hours:.1f} hours")
     print(f"   🚀 Speed: ~{1/speed:.0f} steps/second")
     
-    # Model hyperparameters
+    # Model hyperparameters - FIXED: Pass steps_per_epoch to model
     hparams = {
         "hidden_size": config["hidden_size"],
         "hidden_ff": config["hidden_ff"], 
@@ -259,6 +261,8 @@ def main():
         "learning_rate": config["learning_rate"],
         "batch_size": config["batch_size_per_gpu"],
         "num_epochs": epochs,
+        "steps_per_epoch": steps_per_epoch,  # ADDED: Pass actual steps per epoch
+        "total_steps": total_steps,          # ADDED: Pass total steps
         "attention_type": "performer",
         "norm_type": "rezero", 
         "num_random_features": max(32, config["hidden_size"] // 8),  # Scale with model size
@@ -318,28 +322,23 @@ def main():
         logger = TensorBoardLogger("lightning_logs", name=experiment_name)
         print("📊 Using TensorBoard logging")
     
-    # Callbacks - FIXED for quick test mode
+    # Callbacks - ROBUST and SAFE
     callbacks = [
         ModelCheckpoint(
-            dirpath="checkpoints",  # Changed from checkpoints_beast 😄
+            dirpath="checkpoints",
             filename=f"{experiment_name}-{{epoch:02d}}-{{step:06d}}",
-            save_top_k=-1,  # Save all checkpoints when monitor=None
-            monitor=None,  # Don't monitor any metric, just save every epoch
+            save_top_k=3,  # Keep best 3 checkpoints
+            monitor="train_loss",  # Monitor train_loss instead of val_loss
+            mode="min",
             save_last=True,
-            every_n_epochs=1
+            every_n_epochs=1,
+            save_on_train_epoch_end=True  # Save at end of each epoch
         ),
         LearningRateMonitor(logging_interval='step')
     ]
     
-    # Only add early stopping for full training (not quick test)
-    # if not args.quick_test:
-    #     callbacks.append(
-    #         EarlyStopping(
-    #             monitor="val_loss",
-    #             patience=5,
-    #             mode="min"
-    #         )
-    #     )
+    # REMOVED: Early stopping to prevent validation issues
+    # Training will run for full epochs - more reliable for overnight runs
     
     # Distributed strategy for multi-GPU
     if num_gpus > 1:
@@ -351,7 +350,7 @@ def main():
     else:
         strategy = "auto"
     
-    # Create trainer
+    # Create trainer - ROBUST settings for overnight training
     trainer = Trainer(
         max_epochs=epochs,
         accelerator="gpu",
@@ -363,22 +362,31 @@ def main():
         # Performance optimizations
         gradient_clip_val=1.0,
         accumulate_grad_batches=config.get("accumulate_grad_batches", 1),
-        # Validation settings
-        val_check_interval=0.25 if not args.quick_test else 1.0,
-        limit_val_batches=100 if not args.quick_test else 10,
-        # Logging
-        log_every_n_steps=25 if not args.quick_test else 5,
+        # Validation settings - CONSERVATIVE for reliability
+        val_check_interval=1.0,  # Validate once per epoch
+        limit_val_batches=50,    # Limit validation batches to speed up
+        # Logging - less frequent to reduce overhead
+        log_every_n_steps=50,
         # Speed optimizations
         enable_model_summary=True,
         sync_batchnorm=True if num_gpus > 1 else False,
         # Quick test limitations
         limit_train_batches=50 if args.quick_test else None,
+        # Fault tolerance
+        detect_anomaly=False,  # Disable for speed
+        deterministic=False,   # Allow non-deterministic for speed
+        # Checkpointing
+        enable_checkpointing=True,
+        # Profiling - disable for production
+        profiler=None,
     )
     
     print(f"\n🏋️ Starting training...")
     print(f"💪 Configuration: {num_gpus} GPUs × {config['batch_size_per_gpu']} batch size = {num_gpus * config['batch_size_per_gpu']} total")
     print(f"⚡ Precision: {config['precision']}")
     print(f"🔥 Estimated time: {estimated_hours:.1f} hours")
+    print(f"💾 Checkpoints will be saved every epoch")
+    print(f"🛡️ No early stopping - will run full {epochs} epochs")
     
     if args.quick_test:
         print("🧪 Quick test will run 2 epochs with limited batches")
@@ -388,7 +396,15 @@ def main():
     
     try:
         print("\n🚀 Training started!")
-        trainer.fit(model=model, datamodule=datamodule)
+        
+        # Resume from checkpoint if specified
+        ckpt_path = args.resume_from_checkpoint
+        if ckpt_path and os.path.exists(ckpt_path):
+            print(f"📂 Resuming from checkpoint: {ckpt_path}")
+        else:
+            ckpt_path = None
+        
+        trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
         print("\n🎉 TRAINING COMPLETED SUCCESSFULLY!")
         
         # Save final model (fix pickling issue)
@@ -398,18 +414,23 @@ def main():
             'hparams': hparams,
             'config': config,
             'training_args': vars(args),
-            'vocab_size': vocab_size  # Save vocab size instead of vocab object
+            'vocab_size': vocab_size,
+            'experiment_name': experiment_name,
+            'final_epoch': trainer.current_epoch,
+            'final_step': trainer.global_step
         }, save_path)
         print(f"💾 Model saved to: {save_path}")
         
         # Training summary
         total_time = time.time() - start_time
-        actual_steps_per_second = total_steps / total_time if total_time > 0 else 0
+        actual_steps_per_second = trainer.global_step / total_time if total_time > 0 else 0
         print(f"\n📊 Training Summary:")
         print(f"   ⏱️ Total time: {total_time/3600:.2f} hours ({total_time/60:.1f} minutes)")
         print(f"   🚀 Actual speed: {actual_steps_per_second:.1f} steps/second")
-        print(f"   📉 Best val loss: {trainer.callback_metrics.get('val_loss', 'N/A')}")
+        print(f"   📈 Final epoch: {trainer.current_epoch}")
+        print(f"   🎯 Total steps: {trainer.global_step}")
         print(f"   💾 Model saved: {save_path}")
+        print(f"   📁 Checkpoints in: checkpoints/")
         
         if args.quick_test:
             print(f"\n✅ QUICK TEST SUCCESSFUL!")

@@ -70,6 +70,12 @@ class TransformerEncoder(pl.LightningModule):
         sop_loss = self.sop_loss(sop_preds, target=sop_targs)
 
         total_loss = self.sop_weight * sop_loss + self.mlm_weight * mlm_loss
+        
+        # Log losses for monitoring
+        self.log('train_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('mlm_loss', mlm_loss, on_step=True, on_epoch=True)
+        self.log('sop_loss', sop_loss, on_step=True, on_epoch=True)
+        
         return total_loss
 
     def training_step(self, batch, batch_idx):
@@ -92,7 +98,12 @@ class TransformerEncoder(pl.LightningModule):
         # 1. ENCODER-DECODER
         mlm_preds, sop_preds = self(batch)
         # 2. LOSS
-        return self.calculate_total_loss(mlm_preds, sop_preds, batch)
+        total_loss = self.sop_weight * self.sop_loss(sop_preds, batch["target_sop"].long()) + \
+                     self.mlm_weight * self.mlm_loss(mlm_preds.permute(0, 2, 1), target=batch["target_tokens"].long())
+        
+        # Log validation loss
+        self.log('val_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        return total_loss
 
     def test_step(self, batch, batch_idx):
         # 1. ENCODER-DECODER
@@ -101,7 +112,7 @@ class TransformerEncoder(pl.LightningModule):
         return self.calculate_total_loss(mlm_preds, sop_preds, batch)
 
     def configure_optimizers(self):
-        """Configuration of the Optimizer and the Learning Rate Scheduler."""
+        """Configuration of the Optimizer and the Learning Rate Scheduler - FIXED VERSION"""
         no_decay = [
             "bias",
             "norm",
@@ -112,7 +123,6 @@ class TransformerEncoder(pl.LightningModule):
         ]
 
         # It is advised to avoid the decay on the embedding weights, biases of the model and values of the ReZero gates.
-
         optimizer_grouped_parameters = [
             {
                 "params": [
@@ -139,17 +149,66 @@ class TransformerEncoder(pl.LightningModule):
             eps=self.hparams.epsilon,
         )
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": torch.optim.lr_scheduler.OneCycleLR(
-                    optimizer, max_lr=self.hparams.learning_rate,
-                    epochs=30, steps_per_epoch=375,
-                    three_phase=False, pct_start=0.05, max_momentum=self.hparams.beta1,
-                    div_factor=30
-                ),
-                "interval": "step",
-                "frequency": 1,
-                "name": "learning_rate",
-            },
-        }
+        # FIXED: Use dynamic total_steps calculation or fallback to safe scheduler
+        try:
+            # Try to get total steps from hparams (passed from training script)
+            if hasattr(self.hparams, 'total_steps') and self.hparams.total_steps:
+                total_steps = int(self.hparams.total_steps * 1.1)  # Add 10% buffer
+                log.info(f"Using total_steps from hparams: {total_steps}")
+            elif hasattr(self.hparams, 'steps_per_epoch') and hasattr(self.hparams, 'num_epochs'):
+                total_steps = int(self.hparams.steps_per_epoch * self.hparams.num_epochs * 1.1)  # Add 10% buffer
+                log.info(f"Calculated total_steps: {total_steps}")
+            else:
+                # Fallback: try to estimate from trainer
+                if hasattr(self, 'trainer') and self.trainer and hasattr(self.trainer, 'estimated_stepping_batches'):
+                    total_steps = int(self.trainer.estimated_stepping_batches * 1.1)  # Add 10% buffer
+                    log.info(f"Using trainer estimated steps: {total_steps}")
+                else:
+                    # Ultimate fallback: use large number
+                    total_steps = 100000
+                    log.warning(f"Could not determine total_steps, using fallback: {total_steps}")
+
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, 
+                max_lr=self.hparams.learning_rate,
+                total_steps=total_steps,
+                three_phase=False, 
+                pct_start=0.05, 
+                max_momentum=self.hparams.beta1,
+                div_factor=30
+            )
+            
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                    "name": "learning_rate",
+                },
+            }
+            
+        except Exception as e:
+            log.warning(f"OneCycleLR failed ({e}), falling back to CosineAnnealingLR")
+            
+            # Fallback scheduler - more robust
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.hparams.get('num_epochs', 10) * self.hparams.get('steps_per_epoch', 1000),
+                eta_min=self.hparams.learning_rate * 0.01
+            )
+            
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                    "name": "learning_rate",
+                },
+            }
+        
+        # Final fallback: just return optimizer without scheduler
+        except Exception as e:
+            log.warning(f"All schedulers failed ({e}), using optimizer only")
+            return {"optimizer": optimizer}
