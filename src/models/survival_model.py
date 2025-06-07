@@ -1,299 +1,346 @@
 # src/models/survival_model.py
 """
-Startup Survival Prediction Model
-Following life2vec's cls_model.py pattern for binary classification
+Survival prediction model for startup data
 """
 
+import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
-import torchmetrics
-from typing import Dict, Any
-import logging
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from typing import Dict, Any, Optional
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 
-# Import our CDW Loss implementation
-from .cdw_loss import CDW_CELoss
+# Import from your actual transformer files
+try:
+    # Import the main Transformer from transformer.py
+    from transformer.transformer import Transformer
+except ImportError:
+    try:
+        # Fallback if it's in modules.py
+        from transformer.modules import Transformer
+    except ImportError:
+        raise ImportError("Could not find Transformer class in transformer module")
 
-from ..transformer.transformer import Transformer
+# Since you don't have cls_model.py, let's check modules.py for classification components
+try:
+    from transformer.modules import CLSModel
+except ImportError:
+    # Create our own simple classifier since CLSModel doesn't exist
+    class CLSModel(nn.Module):
+        """Simple classification head for survival prediction"""
+        def __init__(self, d_model: int, num_classes: int = 2, dropout: float = 0.1):
+            super().__init__()
+            self.dropout = nn.Dropout(dropout)
+            self.classifier = nn.Linear(d_model, num_classes)
+        
+        def forward(self, x):
+            # x should be [batch_size, seq_len, d_model]
+            # Use CLS token (first token) for classification
+            if len(x.shape) == 3:  # [batch_size, seq_len, d_model]
+                cls_output = x[:, 0, :]  # Take first token
+            else:  # [batch_size, d_model]
+                cls_output = x
+            
+            cls_output = self.dropout(cls_output)
+            return self.classifier(cls_output)
 
 log = logging.getLogger(__name__)
 
 class StartupSurvivalModel(pl.LightningModule):
     """
-    Startup survival prediction model using pretrained life2vec encoder
-    
-    Architecture:
-    1. Load pretrained startup2vec encoder (frozen/unfrozen)
-    2. Add classification head for binary survival prediction
-    3. Use CDW Cross-Entropy loss for class imbalance
+    Model for predicting startup survival at different time horizons
     """
     
     def __init__(
         self,
-        pretrained_model_path: str,
-        num_classes: int = 2,
-        freeze_encoder: bool = False,
+        vocab_size: int,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 6,
+        max_length: int = 512,
+        num_classes: int = 2,  # survived/died
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
-        # CDW Loss parameters (life2vec values)
-        cdw_alpha: float = 2.0,
-        cdw_delta: float = 3.0,
-        cdw_transform: str = "log",
-        # Class weights for fallback
-        class_weights: list = None,
+        warmup_steps: int = 1000,
+        max_steps: int = 10000,
+        dropout: float = 0.1,
+        prediction_windows: list = None,
+        class_weights: Optional[torch.Tensor] = None,
         **kwargs
     ):
         super().__init__()
         self.save_hyperparameters()
         
-        self.pretrained_model_path = pretrained_model_path
-        self.num_classes = num_classes
-        self.freeze_encoder = freeze_encoder
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
+        if prediction_windows is None:
+            prediction_windows = [1, 2, 3, 4]
+        self.prediction_windows = prediction_windows
         
-        # Load pretrained model
-        self._load_pretrained_encoder()
-        
-        # Classification head
-        self.classification_head = nn.Sequential(
-            nn.Dropout(0.1),
-            nn.Linear(self.encoder.hparams.hidden_size, self.encoder.hparams.hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.encoder.hparams.hidden_size // 2, num_classes)
+        # Base transformer model
+        self.transformer = Transformer(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            max_length=max_length,
+            dropout=dropout,
+            **kwargs
         )
         
-        # Loss function - CDW Cross-Entropy (life2vec methodology)
-        self.loss_fn = CDW_CELoss(
+        # Classification head for survival prediction
+        self.classifier = CLSModel(
+            d_model=d_model,
             num_classes=num_classes,
-            alpha=cdw_alpha,
-            delta=cdw_delta,
-            reduction="mean",
-            transform=cdw_transform,
-            eps=1e-8
+            dropout=dropout
         )
-        log.info(f"Using CDW Cross-Entropy Loss (alpha={cdw_alpha}, delta={cdw_delta}, transform={cdw_transform})")
         
-        # Metrics
-        self.train_acc = torchmetrics.Accuracy(task="binary")
-        self.val_acc = torchmetrics.Accuracy(task="binary") 
-        self.test_acc = torchmetrics.Accuracy(task="binary")
+        # Store class weights for loss calculation
+        self.register_buffer('class_weights', class_weights)
         
-        self.train_auc = torchmetrics.AUROC(task="binary")
-        self.val_auc = torchmetrics.AUROC(task="binary")
-        self.test_auc = torchmetrics.AUROC(task="binary")
-        
-        self.train_f1 = torchmetrics.F1Score(task="binary")
-        self.val_f1 = torchmetrics.F1Score(task="binary")
-        self.test_f1 = torchmetrics.F1Score(task="binary")
-        
-        # Precision/Recall for both classes
-        self.val_precision = torchmetrics.Precision(task="binary", num_classes=2, average=None)
-        self.val_recall = torchmetrics.Recall(task="binary", num_classes=2, average=None)
+        # Metrics storage
+        self.validation_step_outputs = []
+        self.test_step_outputs = []
     
-    def _load_pretrained_encoder(self):
-        """Load pretrained startup2vec encoder"""
-        log.info(f"Loading pretrained model from {self.pretrained_model_path}")
+    def forward(self, input_ids, padding_mask=None, **kwargs):
+        """Forward pass through transformer and classifier"""
+        # Get transformer embeddings
+        transformer_output = self.transformer(
+            input_ids=input_ids,
+            padding_mask=padding_mask,
+            **kwargs
+        )
         
-        # Load pretrained model checkpoint
-        checkpoint = torch.load(self.pretrained_model_path, map_location='cpu')
+        # Get survival predictions
+        survival_logits = self.classifier(transformer_output)
         
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-            hparams = checkpoint['hparams']
-        else:
-            # Direct state dict
-            state_dict = checkpoint
-            # You'll need to provide hparams manually or extract from model
-            raise ValueError("Need hparams from pretrained model")
-        
-        # Create encoder model
-        from ..models.pretrain import TransformerEncoder
-        pretrained_model = TransformerEncoder(hparams=hparams)
-        pretrained_model.load_state_dict(state_dict)
-        
-        # Extract just the transformer encoder (not MLM/SOP heads)
-        self.encoder = pretrained_model.transformer
-        
-        # Freeze encoder if requested
-        if self.freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            log.info("Encoder frozen - only training classification head")
-        else:
-            log.info("Encoder unfrozen - training end-to-end")
+        return {
+            'survival_logits': survival_logits,
+            'transformer_output': transformer_output
+        }
     
-    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass
+    def training_step(self, batch, batch_idx):
+        """Training step with survival loss"""
+        output = self.forward(
+            input_ids=batch['input_ids'],
+            padding_mask=batch['padding_mask']
+        )
         
-        Args:
-            batch: Dictionary containing:
-                - input_ids: [batch, 4, seq_len] - life2vec 4D format
-                - padding_mask: [batch, seq_len]
-                
-        Returns:
-            logits: [batch, num_classes]
-        """
-        input_ids = batch["input_ids"]  # [batch, 4, seq_len]
-        padding_mask = batch["padding_mask"]  # [batch, seq_len]
+        # Calculate survival loss
+        loss = F.cross_entropy(
+            output['survival_logits'], 
+            batch['survival_label'].squeeze(),
+            weight=self.class_weights
+        )
         
-        # Run through encoder
-        encoded = self.encoder(input_ids, padding_mask)  # [batch, seq_len, hidden_size]
+        # Calculate accuracy
+        preds = torch.argmax(output['survival_logits'], dim=1)
+        acc = accuracy_score(
+            batch['survival_label'].cpu().numpy().flatten(),
+            preds.cpu().numpy()
+        )
         
-        # Use [CLS] token representation (first token)
-        cls_representation = encoded[:, 0, :]  # [batch, hidden_size]
-        
-        # Classification head
-        logits = self.classification_head(cls_representation)  # [batch, num_classes]
-        
-        return logits
-    
-    def _shared_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Shared step for train/val/test"""
-        # Filter out invalid labels (-1)
-        valid_mask = (batch["survival_label"] >= 0).flatten()
-        
-        if not valid_mask.any():
-            # No valid samples in batch
-            return None, None, None
-        
-        # Filter batch to valid samples
-        filtered_batch = {}
-        for key, value in batch.items():
-            if key == "survival_label":
-                filtered_batch[key] = value[valid_mask]
-            elif len(value.shape) > 1:
-                filtered_batch[key] = value[valid_mask]
-            else:
-                filtered_batch[key] = value[valid_mask]
-        
-        labels = filtered_batch["survival_label"].long()
-        
-        # Forward pass
-        logits = self.forward(filtered_batch)
-        
-        # Loss
-        loss = self.loss_fn(logits, labels)
-        
-        # Predictions
-        probs = torch.softmax(logits, dim=1)
-        preds = torch.argmax(logits, dim=1)
-        
-        return loss, preds, labels
-    
-    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Training step"""
-        result = self._shared_step(batch, batch_idx)
-        if result[0] is None:
-            return None
-        
-        loss, preds, labels = result
-        
-        # Metrics
-        self.train_acc(preds, labels)
-        self.train_auc(preds, labels)
-        self.train_f1(preds, labels)
-        
-        # Logging
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/acc", self.train_acc, on_step=False, on_epoch=True)
-        self.log("train/auc", self.train_auc, on_step=False, on_epoch=True)
-        self.log("train/f1", self.train_f1, on_step=False, on_epoch=True)
+        # Log metrics
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_acc', acc, on_step=True, on_epoch=True, prog_bar=True)
         
         return loss
     
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+    def validation_step(self, batch, batch_idx):
         """Validation step"""
-        result = self._shared_step(batch, batch_idx)
-        if result[0] is None:
-            return None
+        output = self.forward(
+            input_ids=batch['input_ids'],
+            padding_mask=batch['padding_mask']
+        )
         
-        loss, preds, labels = result
+        # Calculate loss
+        loss = F.cross_entropy(
+            output['survival_logits'], 
+            batch['survival_label'].squeeze(),
+            weight=self.class_weights
+        )
         
-        # Metrics
-        self.val_acc(preds, labels)
-        self.val_auc(preds, labels)
-        self.val_f1(preds, labels)
-        self.val_precision(preds, labels)
-        self.val_recall(preds, labels)
-        
-        # Logging
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/acc", self.val_acc, on_step=False, on_epoch=True)
-        self.log("val/auc", self.val_auc, on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/f1", self.val_f1, on_step=False, on_epoch=True)
-        
-        return loss
-    
-    def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """Test step"""
-        result = self._shared_step(batch, batch_idx)
-        if result[0] is None:
-            return None
-        
-        loss, preds, labels = result
-        
-        # Metrics
-        self.test_acc(preds, labels)
-        self.test_auc(preds, labels)
-        self.test_f1(preds, labels)
-        
-        # Logging
-        self.log("test/loss", loss, on_step=False, on_epoch=True)
-        self.log("test/acc", self.test_acc, on_step=False, on_epoch=True)
-        self.log("test/auc", self.test_auc, on_step=False, on_epoch=True)
-        self.log("test/f1", self.test_f1, on_step=False, on_epoch=True)
+        # Store outputs for epoch-end metrics
+        self.validation_step_outputs.append({
+            'loss': loss,
+            'logits': output['survival_logits'],
+            'labels': batch['survival_label'],
+            'prediction_window': batch['prediction_window']
+        })
         
         return loss
-    
-    def configure_optimizers(self):
-        """Configure optimizers - NO SCHEDULER (like pretraining)"""
-        # You're right - the scheduler caused issues in pretraining, so let's not use it
-        
-        if self.freeze_encoder:
-            # Only optimize classification head
-            optimizer = torch.optim.Adam(
-                self.classification_head.parameters(),
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay
-            )
-            log.info("Optimizing classification head only (encoder frozen)")
-        else:
-            # Different learning rates for encoder vs head
-            param_groups = [
-                {
-                    "params": self.encoder.parameters(),
-                    "lr": self.learning_rate * 0.1,  # Lower LR for pretrained encoder
-                    "weight_decay": self.weight_decay
-                },
-                {
-                    "params": self.classification_head.parameters(),
-                    "lr": self.learning_rate,  # Higher LR for new head
-                    "weight_decay": self.weight_decay
-                }
-            ]
-            
-            optimizer = torch.optim.Adam(param_groups)
-            log.info(f"Optimizing end-to-end: encoder LR={self.learning_rate * 0.1}, head LR={self.learning_rate}")
-        
-        # NO SCHEDULER - just return optimizer
-        return optimizer
     
     def on_validation_epoch_end(self):
-        """Log additional metrics at epoch end"""
-        if hasattr(self, 'val_precision') and hasattr(self, 'val_recall'):
-            precision = self.val_precision.compute()
-            recall = self.val_recall.compute()
-            
-            if len(precision) >= 2 and len(recall) >= 2:
-                # Log class-specific metrics
-                self.log("val/precision_died", precision[0])
-                self.log("val/precision_survived", precision[1])
-                self.log("val/recall_died", recall[0])
-                self.log("val/recall_survived", recall[1])
+        """Calculate validation metrics at epoch end"""
+        if not self.validation_step_outputs:
+            return
+        
+        # Aggregate outputs
+        all_logits = torch.cat([x['logits'] for x in self.validation_step_outputs])
+        all_labels = torch.cat([x['labels'] for x in self.validation_step_outputs])
+        all_windows = torch.cat([x['prediction_window'] for x in self.validation_step_outputs])
+        
+        # Overall metrics
+        avg_loss = torch.stack([x['loss'] for x in self.validation_step_outputs]).mean()
+        preds = torch.argmax(all_logits, dim=1)
+        probs = F.softmax(all_logits, dim=1)[:, 1]  # Probability of survival
+        
+        # Calculate metrics
+        labels_np = all_labels.cpu().numpy().flatten()
+        preds_np = preds.cpu().numpy()
+        probs_np = probs.cpu().numpy()
+        
+        acc = accuracy_score(labels_np, preds_np)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels_np, preds_np, average='weighted', zero_division=0
+        )
+        
+        try:
+            auc = roc_auc_score(labels_np, probs_np)
+        except ValueError:
+            auc = 0.0  # In case of single class
+        
+        # Log overall metrics
+        self.log('val_loss', avg_loss, prog_bar=True)
+        self.log('val_acc', acc, prog_bar=True)
+        self.log('val_precision', precision)
+        self.log('val_recall', recall)
+        self.log('val_f1', f1)
+        self.log('val_auc', auc)
+        
+        # Metrics by prediction window
+        for window in self.prediction_windows:
+            window_mask = (all_windows == window).cpu().numpy()
+            if window_mask.sum() > 0:
+                window_labels = labels_np[window_mask]
+                window_preds = preds_np[window_mask]
                 
-                # Reset metrics
-                self.val_precision.reset()
-                self.val_recall.reset()
+                if len(np.unique(window_labels)) > 1:  # Check for multiple classes
+                    window_acc = accuracy_score(window_labels, window_preds)
+                    self.log(f'val_acc_window_{window}y', window_acc)
+        
+        # Clear outputs
+        self.validation_step_outputs.clear()
+    
+    def test_step(self, batch, batch_idx):
+        """Test step"""
+        output = self.forward(
+            input_ids=batch['input_ids'],
+            padding_mask=batch['padding_mask']
+        )
+        
+        # Store outputs for final metrics
+        self.test_step_outputs.append({
+            'logits': output['survival_logits'],
+            'labels': batch['survival_label'],
+            'prediction_window': batch['prediction_window']
+        })
+        
+        return output
+    
+    def on_test_epoch_end(self):
+        """Calculate test metrics"""
+        if not self.test_step_outputs:
+            return
+        
+        # Similar to validation metrics but for test
+        all_logits = torch.cat([x['logits'] for x in self.test_step_outputs])
+        all_labels = torch.cat([x['labels'] for x in self.test_step_outputs])
+        all_windows = torch.cat([x['prediction_window'] for x in self.test_step_outputs])
+        
+        preds = torch.argmax(all_logits, dim=1)
+        probs = F.softmax(all_logits, dim=1)[:, 1]
+        
+        labels_np = all_labels.cpu().numpy().flatten()
+        preds_np = preds.cpu().numpy()
+        probs_np = probs.cpu().numpy()
+        
+        # Calculate and log test metrics
+        acc = accuracy_score(labels_np, preds_np)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels_np, preds_np, average='weighted', zero_division=0
+        )
+        
+        try:
+            auc = roc_auc_score(labels_np, probs_np)
+        except ValueError:
+            auc = 0.0
+        
+        self.log('test_acc', acc)
+        self.log('test_precision', precision)
+        self.log('test_recall', recall)
+        self.log('test_f1', f1)
+        self.log('test_auc', auc)
+        
+        # Test metrics by window
+        for window in self.prediction_windows:
+            window_mask = (all_windows == window).cpu().numpy()
+            if window_mask.sum() > 0:
+                window_labels = labels_np[window_mask]
+                window_preds = preds_np[window_mask]
+                
+                if len(np.unique(window_labels)) > 1:
+                    window_acc = accuracy_score(window_labels, window_preds)
+                    self.log(f'test_acc_window_{window}y', window_acc)
+        
+        self.test_step_outputs.clear()
+    
+    def configure_optimizers(self):
+        """Configure optimizer and scheduler"""
+        optimizer = AdamW(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+        
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=self.hparams.max_steps,
+            eta_min=1e-6
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
+    
+    @classmethod
+    def load_pretrained(cls, checkpoint_path: str, **kwargs):
+        """Load model from pretrained transformer checkpoint"""
+        # Load the checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Extract model state dict
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+        
+        # Create new model instance
+        model = cls(**kwargs)
+        
+        # Load transformer weights (partial loading)
+        transformer_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('transformer.'):
+                # Remove 'transformer.' prefix if present
+                new_key = key.replace('transformer.', '', 1)
+                transformer_state_dict[new_key] = value
+            elif 'transformer' not in key and 'classifier' not in key:
+                # Assume it's a transformer weight
+                transformer_state_dict[key] = value
+        
+        # Load transformer weights
+        missing_keys, unexpected_keys = model.transformer.load_state_dict(
+            transformer_state_dict, strict=False
+        )
+        
+        log.info(f"Loaded pretrained transformer. Missing keys: {len(missing_keys)}, "
+                f"Unexpected keys: {len(unexpected_keys)}")
+        
+        return model

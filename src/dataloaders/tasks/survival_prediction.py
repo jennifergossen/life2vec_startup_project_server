@@ -11,6 +11,7 @@ import torch
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 from functools import cached_property
+from pathlib import Path
 
 from ..types import StartupBackground, StartupDocument, EncodedDocument
 from .startup_base import StartupTask

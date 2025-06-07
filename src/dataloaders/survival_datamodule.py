@@ -1,7 +1,7 @@
 # src/dataloaders/survival_datamodule.py
 """
 Survival Prediction DataModule
-Extends existing life2vec infrastructure for survival prediction
+Standalone implementation that bypasses broken datamodule.py
 """
 
 import logging
@@ -13,9 +13,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 
-from .datamodule import L2VDataModule
+# Import only what we need for survival prediction
 from .tasks.survival_prediction import SurvivalPrediction
-from .vocabulary import CorpusVocabulary
 
 log = logging.getLogger(__name__)
 
@@ -48,15 +47,15 @@ class SurvivalDataset(Dataset):
         """
         examples = []
         
-        # Group sentences by company
-        grouped = self.corpus_sentences.groupby(level=0)  # Group by index (company_id/uuid)
+        # Group sentences by company UUID (your existing pattern)
+        grouped = self.corpus_sentences.groupby(level=0)  # Group by index (UUID)
         
-        for company_id, company_sentences in grouped:
+        for company_uuid, company_sentences in grouped:
             # Skip companies without survival labels
-            if company_id not in self.survival_labels.index:
+            if company_uuid not in self.survival_labels.index:
                 continue
             
-            company_info = self.survival_labels.loc[company_id]
+            company_info = self.survival_labels.loc[company_uuid]
             survival_label = company_info['survival_label']
             
             # Skip invalid labels
@@ -66,7 +65,7 @@ class SurvivalDataset(Dataset):
             # Create one example per prediction window
             for window_years in self.task.prediction_windows:
                 examples.append({
-                    'company_id': company_id,
+                    'company_uuid': company_uuid,
                     'window_years': window_years,
                     'survival_label': int(survival_label),
                     'company_sentences': company_sentences
@@ -100,7 +99,7 @@ class SurvivalDataset(Dataset):
         encoded.survival_label = np.array([example['survival_label']])
         encoded.prediction_window = np.array([example['window_years']])
         
-        # Convert to tensors
+        # Convert to tensors (maintaining your 4D format)
         return {
             'sequence_id': torch.tensor(encoded.sequence_id, dtype=torch.long),
             'input_ids': torch.tensor(encoded.input_ids, dtype=torch.long),
@@ -114,7 +113,7 @@ class SurvivalDataset(Dataset):
 class SurvivalDataModule(pl.LightningDataModule):
     """
     DataModule for startup survival prediction
-    Extends your existing corpus/vocabulary infrastructure
+    Standalone implementation that reuses your existing processed data
     """
     
     def __init__(
@@ -136,16 +135,16 @@ class SurvivalDataModule(pl.LightningDataModule):
             prediction_windows = [1, 2, 3, 4]
         self.prediction_windows = prediction_windows
         
-        # Initialize task
-        self.task = SurvivalPrediction(
+        # Load your existing vocabulary (created during pretraining)
+        self.vocabulary = self._load_vocabulary()
+        
+        # Initialize survival prediction task
+        self.survival_task = SurvivalPrediction(
             name="survival_prediction",
             max_length=512,
             prediction_windows=prediction_windows,
             **kwargs
         )
-        
-        # Load vocabulary (reuse from pretraining)
-        self.vocabulary = self._load_vocabulary()
         
         # Initialize datasets
         self.train_dataset = None
@@ -153,30 +152,43 @@ class SurvivalDataModule(pl.LightningDataModule):
         self.test_dataset = None
     
     def _load_vocabulary(self):
-        """Load vocabulary from pretraining"""
+        """Load the existing vocabulary from pretraining"""
         vocab_path = Path(f"data/processed/vocab/{self.vocab_name}/result.tsv")
         
         if not vocab_path.exists():
-            raise FileNotFoundError(f"Vocabulary not found: {vocab_path}")
+            raise FileNotFoundError(f"Vocabulary file not found: {vocab_path}")
         
-        # Create a simple vocabulary object
-        class SimpleVocabulary:
+        # Load the vocabulary file directly (created during pretraining)
+        vocab_df = pd.read_csv(vocab_path, sep='\t')
+        
+        # Create a simple vocabulary wrapper that provides the interface we need
+        class VocabularyWrapper:
             def __init__(self, vocab_df):
                 self.vocab_df = vocab_df
                 self.token2index = dict(zip(vocab_df.TOKEN, vocab_df.ID))
                 self.index2token = dict(zip(vocab_df.ID, vocab_df.TOKEN))
             
+            def vocab(self):
+                return self.vocab_df
+            
+            def get_pad_token_id(self):
+                return self.token2index.get('[PAD]', 0)
+            
+            def get_cls_token_id(self):
+                return self.token2index.get('[CLS]', 1)
+            
+            def get_sep_token_id(self):
+                return self.token2index.get('[SEP]', 2)
+            
             def size(self):
-                return len(self.token2index)
+                return len(self.vocab_df)
         
-        vocab_df = pd.read_csv(vocab_path, sep='\t')
-        vocabulary = SimpleVocabulary(vocab_df)
-        
-        log.info(f"Loaded vocabulary with {vocabulary.size()} tokens")
+        vocabulary = VocabularyWrapper(vocab_df)
+        log.info(f"Loaded existing vocabulary with {vocabulary.size()} tokens from pretraining")
         return vocabulary
     
     def _load_corpus_sentences(self, split: str):
-        """Load corpus sentences for a split"""
+        """Load your existing processed corpus sentences"""
         corpus_path = Path(f"data/processed/corpus/{self.corpus_name}/sentences/{split}/sentences.parquet")
         
         if not corpus_path.exists():
@@ -188,9 +200,9 @@ class SurvivalDataModule(pl.LightningDataModule):
         return sentences_df
     
     def setup(self, stage: Optional[str] = None):
-        """Setup datasets"""
-        # Register task with this datamodule
-        self.task.register(self)
+        """Setup datasets for survival prediction"""
+        # Register survival task with this datamodule
+        self.survival_task.datamodule = self
         
         if stage == "fit" or stage is None:
             # Load train and validation data
@@ -198,10 +210,10 @@ class SurvivalDataModule(pl.LightningDataModule):
             val_sentences = self._load_corpus_sentences("val")
             
             self.train_dataset = SurvivalDataset(
-                train_sentences, self.task, "train"
+                train_sentences, self.survival_task, "train"
             )
             self.val_dataset = SurvivalDataset(
-                val_sentences, self.task, "val"
+                val_sentences, self.survival_task, "val"
             )
         
         if stage == "test" or stage is None:
@@ -209,7 +221,7 @@ class SurvivalDataModule(pl.LightningDataModule):
             test_sentences = self._load_corpus_sentences("test")
             
             self.test_dataset = SurvivalDataset(
-                test_sentences, self.task, "test"
+                test_sentences, self.survival_task, "test"
             )
     
     def train_dataloader(self):
@@ -243,7 +255,7 @@ class SurvivalDataModule(pl.LightningDataModule):
         )
     
     def get_class_distribution(self):
-        """Get class distribution for all splits"""
+        """Get class distribution for survival prediction"""
         if not hasattr(self, 'train_dataset') or self.train_dataset is None:
             self.setup('fit')
         
@@ -264,3 +276,19 @@ class SurvivalDataModule(pl.LightningDataModule):
                 }
         
         return stats
+    
+    def get_vocab_size(self):
+        """Get vocabulary size from your existing vocabulary"""
+        return self.vocabulary.vocab().shape[0]
+    
+    def get_pad_token_id(self):
+        """Get pad token ID from your existing vocabulary"""
+        return self.vocabulary.get_pad_token_id()
+    
+    def get_cls_token_id(self):
+        """Get CLS token ID from your existing vocabulary"""
+        return self.vocabulary.get_cls_token_id()
+    
+    def get_sep_token_id(self):
+        """Get SEP token ID from your existing vocabulary"""
+        return self.vocabulary.get_sep_token_id()
