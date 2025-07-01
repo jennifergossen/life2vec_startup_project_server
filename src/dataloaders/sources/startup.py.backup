@@ -1,0 +1,365 @@
+# src/dataloaders/sources/startup.py
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List  # ✅ FIXED: Added missing import
+import re
+import pandas as pd
+import dask.dataframe as dd
+from datetime import datetime
+
+from ..decorators import save_parquet
+from ..ops import sort_partitions
+from ..serialize import DATA_ROOT
+from .base import FIELD_TYPE, TokenSource, Binned
+
+
+class StartupDescriptionTokenizer:
+    """FIXED: Proper categorization of company descriptions instead of raw text"""
+    
+    def __init__(self):
+        self.stopwords = {
+            'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 
+            'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 
+            'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+            'this', 'that', 'these', 'those', 'who', 'what', 'where', 'when', 'why', 'how',
+            'can', 'said', 'get', 'go', 'know', 'take', 'see', 'come', 'think', 'look',
+            'want', 'give', 'use', 'find', 'tell', 'ask', 'work', 'seem', 'feel', 'try'
+        }
+
+        # Industry/domain categorization for company descriptions
+        self.industry_keywords = {
+            'FINTECH': ['fintech', 'finance', 'banking', 'payment', 'lending', 'credit', 'trading', 'investment', 'cryptocurrency', 'blockchain', 'defi'],
+            'HEALTHCARE': ['health', 'medical', 'healthcare', 'biotech', 'pharma', 'telemedicine', 'diagnostic', 'therapy', 'clinical'],
+            'ECOMMERCE': ['ecommerce', 'marketplace', 'retail', 'shopping', 'commerce', 'store', 'selling', 'buying'],
+            'SAAS': ['saas', 'software', 'platform', 'tool', 'application', 'service', 'solution', 'system'],
+            'AI_ML': ['ai', 'artificial intelligence', 'machine learning', 'ml', 'neural', 'deep learning', 'automation', 'robotics'],
+            'MOBILITY': ['transport', 'logistics', 'delivery', 'shipping', 'ride', 'mobility', 'automotive', 'vehicle'],
+            'FOOD': ['food', 'restaurant', 'cooking', 'recipe', 'meal', 'dining', 'nutrition', 'beverage'],
+            'EDUCATION': ['education', 'learning', 'teaching', 'course', 'training', 'skill', 'student', 'academic'],
+            'REAL_ESTATE': ['real estate', 'property', 'housing', 'rental', 'construction', 'building'],
+            'MEDIA': ['media', 'content', 'video', 'streaming', 'entertainment', 'gaming', 'social', 'network'],
+            'ENERGY': ['energy', 'renewable', 'solar', 'wind', 'battery', 'clean', 'sustainability', 'green'],
+            'ENTERPRISE': ['enterprise', 'business', 'corporate', 'management', 'productivity', 'workflow', 'crm'],
+            'SECURITY': ['security', 'cybersecurity', 'privacy', 'protection', 'safety', 'encryption'],
+            'IOT': ['iot', 'internet of things', 'sensor', 'device', 'connected', 'smart', 'hardware'],
+            'ANALYTICS': ['analytics', 'data', 'insight', 'intelligence', 'reporting', 'dashboard', 'metrics']
+        }
+
+        # Business model categorization
+        self.business_model_keywords = {
+            'B2B': ['b2b', 'business to business', 'enterprise', 'corporate', 'company', 'organization'],
+            'B2C': ['b2c', 'consumer', 'customer', 'individual', 'personal', 'retail'],
+            'MARKETPLACE': ['marketplace', 'platform', 'connect', 'match', 'broker', 'intermediary'],
+            'SUBSCRIPTION': ['subscription', 'recurring', 'monthly', 'saas', 'service'],
+            'ECOMMERCE': ['sell', 'buy', 'shop', 'store', 'product', 'goods'],
+            'FREEMIUM': ['free', 'freemium', 'premium', 'upgrade'],
+            'ADVERTISING': ['advertising', 'ads', 'marketing', 'promotion']
+        }
+
+        # Technology categorization
+        self.tech_keywords = {
+            'MOBILE': ['mobile', 'app', 'ios', 'android', 'smartphone'],
+            'WEB': ['web', 'website', 'browser', 'online', 'internet'],
+            'API': ['api', 'integration', 'connect', 'interface'],
+            'CLOUD': ['cloud', 'aws', 'azure', 'hosting', 'infrastructure'],
+            'DATABASE': ['database', 'data', 'storage', 'analytics'],
+            'BLOCKCHAIN': ['blockchain', 'crypto', 'decentralized', 'smart contract'],
+            'VR_AR': ['vr', 'ar', 'virtual reality', 'augmented reality', 'immersive']
+        }
+
+    def categorize_company_description(self, description: str) -> List[str]:
+        """
+        Convert company description into categorical tokens that can be learned
+        Returns multiple category tokens instead of raw text
+        """
+        if pd.isna(description) or str(description).lower() in ['nan', 'none', '', 'no_description']:
+            return ["INDUSTRY_OTHER", "MODEL_OTHER", "TECH_OTHER"]
+        
+        desc_lower = str(description).lower()
+        tokens = []
+        
+        # 1. Industry categorization (most important)
+        industry_found = False
+        for industry, keywords in self.industry_keywords.items():
+            if any(keyword in desc_lower for keyword in keywords):
+                tokens.append(f"INDUSTRY_{industry}")
+                industry_found = True
+                break  # Take first match for primary industry
+        
+        if not industry_found:
+            tokens.append("INDUSTRY_OTHER")
+        
+        # 2. Business model categorization
+        business_model_found = False
+        for model, keywords in self.business_model_keywords.items():
+            if any(keyword in desc_lower for keyword in keywords):
+                tokens.append(f"MODEL_{model}")
+                business_model_found = True
+                break  # Take first match
+                
+        if not business_model_found:
+            tokens.append("MODEL_OTHER")
+        
+        # 3. Technology categorization (can have multiple, but limit to 1)
+        tech_found = False
+        for tech, keywords in self.tech_keywords.items():
+            if any(keyword in desc_lower for keyword in keywords):
+                tokens.append(f"TECH_{tech}")
+                tech_found = True
+                break  # Take first match to avoid too many tokens
+        
+        if not tech_found:
+            tokens.append("TECH_OTHER")
+        
+        return tokens
+
+    def extract_key_terms(self, text: str, max_terms: int = 2) -> List[str]:
+        """Extract meaningful terms from text"""
+        if pd.isna(text) or text == "" or str(text).lower() in ['nan', 'none']:
+            return []
+        
+        text = re.sub(r'[^\w\s]', ' ', str(text).lower())
+        words = text.split()
+        
+        meaningful_words = [
+            w for w in words 
+            if w not in self.stopwords and len(w) > 2 and w.replace('_', '').isalnum()
+        ]
+        
+        return meaningful_words[:max_terms]
+
+
+@dataclass
+class StartupSource(TokenSource):
+    """✅ FIXED: Generates learnable categorical tokens for startup static attributes"""
+
+    name: str = "startup"
+    fields: List[FIELD_TYPE] = field(
+        default_factory=lambda: [
+            "COUNTRY",
+            "CATEGORY", 
+            "EMPLOYEE",
+            "DESCRIPTION"  # Now properly categorized
+        ]
+    )
+
+    # ✅ CORRECT: Path to your company data
+    input_csv: Path = DATA_ROOT / "cleaned" / "cleaned_startup" / "company_base_cleaned.csv"
+
+    @save_parquet(
+        DATA_ROOT / "processed/sources/{self.name}/tokenized",
+        on_validation_error="recompute",
+        verify_index=False,
+        parquet_kwargs={
+            "engine": "pyarrow",
+            "write_index": True,
+            "compression": "snappy"
+        }
+    )
+    def tokenized(self) -> dd.DataFrame:
+        """✅ FIXED: Tokenizes with COMPANY_ID preservation"""
+        print("🏢 Tokenizing startup static data with CATEGORIZED descriptions...")
+        
+        try:
+            # Get the processed data
+            processed_data = self.indexed()
+            
+            # Sort by record date
+            result = processed_data
+            
+            # Select required columns
+            columns_to_keep = ["RECORD_DATE"] + [f for f in self.field_labels() if f in result.columns]
+            result = result[columns_to_keep]
+            
+            # Description categorization FIRST
+            if 'DESCRIPTION' in result.columns:
+                print("🔄 Categorizing company descriptions...")
+                
+                def process_description_partition(df):
+                    tokenizer = StartupDescriptionTokenizer()
+                    description_tokens = df['DESCRIPTION'].apply(
+                        lambda x: ' '.join(tokenizer.categorize_company_description(x))
+                    )
+                    df['DESCRIPTION'] = description_tokens
+                    return df
+                
+                meta = result._meta.copy()
+                meta['DESCRIPTION'] = 'string'
+                
+                result = result.map_partitions(
+                    process_description_partition,
+                    meta=meta
+                )
+                
+                print("✅ Company descriptions categorized into learnable tokens!")
+            
+            # Add prefixes to other categorical fields  
+            assign_dict = {}
+            for field in ['COUNTRY', 'CATEGORY', 'EMPLOYEE']:
+                if field in result.columns:
+                    cleaned_values = result[field].fillna("Unknown").astype('string').str.replace(' ', '_', regex=False)
+                    assign_dict[field] = f"{field}_" + cleaned_values
+            
+            if assign_dict:
+                result = result.assign(**assign_dict)
+            
+            # ✅ CRITICAL FIX: Index is already COMPANY_ID, keep it
+            result = result.reset_index()
+            if 'COMPANY_ID' in result.columns:
+                result = result.set_index("COMPANY_ID")
+                print("✅ Set COMPANY_ID as index (preserved original IDs)")
+            else:
+                print("⚠️ Warning: COMPANY_ID column not found after processing")
+                print(f"Available columns: {list(result.columns)}")
+                raise ValueError("COMPANY_ID not found!")
+            
+            result = result.repartition(partition_size="200MB")
+            
+            print("✅ Startup static data tokenized with PRESERVED COMPANY_IDs!")
+            assert isinstance(result, dd.DataFrame)
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error in tokenized method: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def indexed(self) -> dd.DataFrame:
+        """✅ FIXED: Process and index using COMPANY_ID with DETERMINISTIC ordering"""
+        print("📊 Processing startup static data...")
+        
+        try:
+            parsed_data = self.parsed()
+            
+            # ✅ CRITICAL FIX: Add deterministic sorting by COMPANY_ID
+            print("🔄 Sorting data by COMPANY_ID for consistent ordering...")
+            sorted_data = parsed_data.sort_values("COMPANY_ID")
+            
+            # ✅ Set index to COMPANY_ID (now deterministically ordered)
+            result = sorted_data.set_index("COMPANY_ID")
+            
+            print("✅ Startup data indexed successfully with COMPANY_ID (deterministic order)")
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error in indexed method: {e}")
+            raise
+
+    def parsed(self) -> dd.DataFrame:
+        """✅ FIXED: Parse the startup CSV file and PRESERVE original COMPANY_ID"""
+        print("📁 Loading startup data...")
+        
+        try:
+            # Read the CSV file
+            df = pd.read_csv(self.input_csv)
+            print(f"📊 Loaded {len(df)} companies")
+            
+            # Filter to include only companies (if needed)
+            if 'roles' in df.columns:
+                df = df[df['roles'] == 'company']
+                print(f"📊 Filtered to {len(df)} companies")
+            
+            # ✅ CRITICAL FIX: PRESERVE original COMPANY_ID (don't rename to STARTUP_ID)
+            column_mapping = {
+                'COMPANY_ID': 'COMPANY_ID',               # ✅ KEEP ORIGINAL ID NAME
+                'country_code': 'COUNTRY',            
+                'category_groups_list': 'CATEGORY',   
+                'employee_count': 'EMPLOYEE',         
+                'short_description': 'DESCRIPTION',   
+                'founded_on': 'founded_on'            
+            }
+            
+            # Select and rename columns
+            required_columns = list(column_mapping.keys())
+            
+            # Check if all required columns exist
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            if missing_cols:
+                print(f"⚠️ Missing columns: {missing_cols}")
+                for col in missing_cols:
+                    df[col] = "Unknown"
+            
+            df = df[required_columns].rename(columns=column_mapping)
+            
+            # Process founded_on date
+            df['founded_on'] = pd.to_datetime(df['founded_on'], errors='coerce')
+            df['RECORD_DATE'] = df['founded_on'].fillna(pd.Timestamp('2020-01-01'))
+            df = df.drop(columns=['founded_on'])
+            
+            # Clean category field - extract first category
+            df['CATEGORY'] = df['CATEGORY'].apply(
+                lambda x: str(x).split(',')[0].strip() if pd.notna(x) and ',' in str(x) else str(x)
+            )
+            
+            # Clean employee count
+            def clean_employee_count(x):
+                if pd.isna(x):
+                    return "Unknown"
+                x_str = str(x).lower()
+                
+                if any(term in x_str for term in ['1-10', '11-50', '51-200', '201-500', '500+']):
+                    return x_str
+                
+                if '1-10' in x_str or 'very small' in x_str:
+                    return "1-10"
+                elif '11-50' in x_str or 'small' in x_str:
+                    return "11-50"  
+                elif '51-200' in x_str or 'medium' in x_str:
+                    return "51-200"
+                elif '201-500' in x_str:
+                    return "201-500"
+                elif '500+' in x_str or 'large' in x_str:
+                    return "500+"
+                else:
+                    return "Unknown"
+            
+            df['EMPLOYEE'] = df['EMPLOYEE'].apply(clean_employee_count)
+            
+            # Clean other fields
+            df['COUNTRY'] = df['COUNTRY'].fillna('Unknown')
+            df['CATEGORY'] = df['CATEGORY'].fillna('Unknown')
+            df['DESCRIPTION'] = df['DESCRIPTION'].fillna('NO_DESCRIPTION')
+            
+            # ✅ CRITICAL: Remove rows with invalid COMPANY_ID (not STARTUP_ID)
+            df = df.dropna(subset=['COMPANY_ID'])
+            
+            print(f"✅ Processed {len(df)} startup records")
+            print(f"📊 Sample data:")
+            print(f"   COMPANY_ID: {df['COMPANY_ID'].iloc[0] if len(df) > 0 else 'N/A'}")
+            print(f"   COUNTRY: {df['COUNTRY'].iloc[0] if len(df) > 0 else 'N/A'}")
+            print(f"   CATEGORY: {df['CATEGORY'].iloc[0] if len(df) > 0 else 'N/A'}")
+            print(f"   EMPLOYEE: {df['EMPLOYEE'].iloc[0] if len(df) > 0 else 'N/A'}")
+            print(f"   DESCRIPTION: {str(df['DESCRIPTION'].iloc[0])[:50] if len(df) > 0 else 'N/A'}...")
+            
+            # Create dask DataFrame
+            npartitions = max(1, min(10, len(df) // 50000))
+            ddf = dd.from_pandas(df, npartitions=npartitions)
+            
+            return ddf
+            
+        except Exception as e:
+            print(f"❌ Error parsing startup data: {e}")
+            raise
+
+    def prepare(self) -> None:
+        """Prepare startup static data with timing"""
+        print("🚀 Preparing startup static data with CATEGORIZED descriptions...")
+        
+        try:
+            import time
+            start_time = time.time()
+            
+            # Run tokenization
+            self.tokenized()
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            print(f"🎉 Startup static data preparation complete in {duration:.1f} seconds!")
+            print("✅ Company descriptions now properly categorized (not raw text)")
+            print("✅ COMPANY_IDs preserved for proper matching!")
+            
+        except Exception as e:
+            print(f"❌ Error during preparation: {e}")
+            raise

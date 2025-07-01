@@ -1,0 +1,27 @@
+STARTUP SURVIVAL - REAL LIFE2VEC METRICS
+==================================================
+
+CALCULATED FROM YOUR EXACT TRAINING RESULTS:
+
+TRADITIONAL METRICS:
+AUC-ROC: 0.6711
+Accuracy (balanced): 0.5567
+F1-Score: 0.6790
+Precision: 0.9358
+Recall: 0.5567
+
+LIFE2VEC METRICS:
+C-MCC (Real): 0.7060
+AUL (Estimated): 13.058
+Balanced Accuracy: 0.7768
+Specificity: 0.9969
+
+CONFUSION MATRIX:
+True Positives: 9,105
+True Negatives: 197,840
+False Positives: 624
+False Negatives: 7,249
+
+KEY INSIGHT:
+Your balanced accuracy approach with class weights
+already implements life2vec-style robust evaluation.
