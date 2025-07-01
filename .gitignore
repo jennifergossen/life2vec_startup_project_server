@@ -172,3 +172,6 @@ data/
 data/
 *.csv
 # Large data files - store separately
+data/cleaned/cleaned_startup/combined_events_cleaned.pkl
+data/cleaned/cleaned_startup/combined_events_cleaned.csv
+data/processed/corpus/startup_corpus/sentences/train/sentences.txt
